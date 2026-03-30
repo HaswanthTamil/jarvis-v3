@@ -40,7 +40,7 @@ app.post('/api/classify', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/plan', (req: Request, res: Response) => {
+app.post('/api/plan', async (req: Request, res: Response) => {
   const { intent, entities } = req.body;
 
   if (!intent) {
@@ -49,7 +49,7 @@ app.post('/api/plan', (req: Request, res: Response) => {
 
   try {
     console.log(`Generating plan for intent: "${intent}"`);
-    const plan = generatePlan(intent, entities || []);
+    const plan = await generatePlan(intent, entities || []);
     res.json(plan);
   } catch (error: any) {
     console.error('Planning error:', error.message);
