@@ -66,176 +66,44 @@ Output Format:
 const SYSTEM_PROMPT_FOR_SMALL_MODEL = `
 You are a planning agent for Jarvis.
 
-Your job is to convert a user request into a STRICT execution plan using a fixed enum system.
-
-You MUST break the request into clear, atomic steps.
+Your job is to convert a user request into a STRICT execution plan using a fixed enum system (Intermediate Representation).
 
 ---
-
 AVAILABLE STEP TYPES (ENUM)
-
-You are ONLY allowed to use these:
-
-RETRIEVE_MEMORY
-BUILD_CONTEXT
-REASON
-GENERATE_CODE
-GENERATE_FILE
-RUN_COMMAND
-
-DO NOT invent new types.
+- RETRIEVE_MEMORY: { "scope": "projects|knowledge|personal", "query": "string", "limit": number }
+- BUILD_CONTEXT: { "include_memory": boolean }
+- REASON: { "model": "gemini|local", "temperature": number }
+- GENERATE_CODE: { "language": "string", "description": "string" }
+- GENERATE_FILE: { "type": "pdf|txt|md", "content": "string" }
+- RUN_COMMAND: { "command": "string" }
 
 ---
-
-STEP DEFINITIONS
-
-RETRIEVE_MEMORY
-- Use if user refers to stored info (projects, personal, knowledge)
-- args:
-  { "scope": "projects|knowledge|personal", "query": "string", "limit": number }
-
-BUILD_CONTEXT
-- ALWAYS required before execution
-- args:
-  { "include_memory": boolean }
-
-REASON
-- Used to display output, explain, or respond to user
-- args:
-  { "model": "gemini|local", "temperature": number }
-
-GENERATE_CODE
-- Use when user asks to create code
-- args:
-  { "language": "string", "description": "string" }
-
-GENERATE_FILE
-- Use when user wants a file
-- args:
-  { "type": "pdf|txt|md", "content": "string" }
-
-RUN_COMMAND
-- Use for ANY system/terminal/API execution
-- args:
-  { "command": "string" }
+PLANNING RULES
+1. MANDATORY: Every plan MUST start with a BUILD_CONTEXT step.
+2. If memory is needed, use RETRIEVE_MEMORY first, then BUILD_CONTEXT with include_memory: true.
+3. Multiple steps are encouraged for complex tasks (e.g., BUILD -> RUN_COMMAND -> REASON).
+4. OUTPUT ONLY JSON. No explanations.
 
 ---
-
-PLANNING STRATEGY (VERY IMPORTANT)
-
-You MUST decompose tasks step-by-step.
-
-Common patterns:
-
-- Run a script → RUN_COMMAND
-- Call an API → RUN_COMMAND (use curl or similar)
-- Pass output between steps → reference like "<output_of_step_X>"
-- Show final output → REASON with model "local"
-
-DO NOT combine multiple actions into one step.
-
----
-
-META RULES
-
-- requires_memory = true ONLY if RETRIEVE_MEMORY is used
-- requires_reasoning = true if task has multiple steps or transformations
-
----
-
-STEP ORDER RULES
-
-1. RETRIEVE_MEMORY (optional)
-2. BUILD_CONTEXT (mandatory)
-3. One or more execution steps
-4. Final step MUST be:
-   - REASON OR
-   - GENERATE_CODE OR
-   - GENERATE_FILE OR
-   - RUN_COMMAND
-
----
-
-OUTPUT FORMAT (STRICT JSON ONLY)
-
-{
-  "meta": {
-    "intent": "string",
-    "requires_memory": boolean,
-    "requires_reasoning": boolean
-  },
-  "steps": [
-    {
-      "id": "1",
-      "type": "BUILD_CONTEXT",
-      "args": { "include_memory": false }
-    }
-  ]
-}
-
----
-
-EXAMPLE
-
-User Input:
-Intent: "run script and send output to API and print response"
-Entities: ["business.sh", "https://mybusiness.com/api/script"]
-
+FEW-SHOT EXAMPLE
+User Input: "run script.sh and explain output"
 Output:
-
 {
-  "meta": {
-    "intent": "script_execution_pipeline",
-    "requires_memory": false,
-    "requires_reasoning": true
-  },
+  "meta": { "intent": "script_execution", "requires_memory": false, "requires_reasoning": true },
   "steps": [
-    {
-      "id": "1",
-      "type": "BUILD_CONTEXT",
-      "args": { "include_memory": false }
-    },
-    {
-      "id": "2",
-      "type": "RUN_COMMAND",
-      "args": {
-        "command": "bash business.sh"
-      }
-    },
-    {
-      "id": "3",
-      "type": "RUN_COMMAND",
-      "args": {
-        "command": "curl -X POST https://mybusiness.com/api/script -d \"<output_of_step_2>\""
-      }
-    },
-    {
-      "id": "4",
-      "type": "REASON",
-      "args": {
-        "model": "local",
-        "temperature": 0
-      }
-    }
+    { "id": "1", "type": "BUILD_CONTEXT", "args": { "include_memory": false } },
+    { "id": "2", "type": "RUN_COMMAND", "args": { "command": "bash script.sh" } },
+    { "id": "3", "type": "REASON", "args": { "model": "local", "temperature": 0 } }
   ]
 }
+`;
 
----
-
-IMPORTANT
-
-- ALWAYS return multiple steps for multi-action tasks
-- NEVER return only BUILD_CONTEXT unless the request is trivial
-- ALWAYS think in sequence
-- OUTPUT JSON ONLY
-`
-
-const SYSTEM_PROMPT = process.env.LOCAL_SLM_SIZE == "small" ? SYSTEM_PROMPT_FOR_SMALL_MODEL : SYSTEM_PROMPT_FOR_LARGE_MODEL;
+const SYSTEM_PROMPT = process.env.LOCAL_SLM_SIZE === 'small' ? SYSTEM_PROMPT_FOR_SMALL_MODEL : SYSTEM_PROMPT_FOR_LARGE_MODEL;
 
 export interface Step {
   id: string;
   type: PlanStepType;
-  args: Record<string, unknown>;
+  args: Record<string, any>;
 }
 
 export interface PlanMeta {
@@ -249,7 +117,73 @@ export interface ExecutionPlan {
   steps: Step[];
 }
 
-export async function generatePlan(intent: string, entities: string[]): Promise<ExecutionPlan> {
+/**
+ * Layer 3: Normalizer
+ * Auto-corrects common LLM mistakes to make plans executable.
+ */
+export function normalizePlan(plan: ExecutionPlan): ExecutionPlan {
+  const normalizedSteps: Step[] = [...plan.steps];
+
+  // 1. Ensure BUILD_CONTEXT exists at the start
+  const firstStep = normalizedSteps[0];
+  if (!firstStep || firstStep.type !== PlanStepType.BUILD_CONTEXT) {
+    normalizedSteps.unshift({
+      id: "placeholder",
+      type: PlanStepType.BUILD_CONTEXT,
+      args: { include_memory: plan.meta.requires_memory || normalizedSteps.some(s => s.type === PlanStepType.RETRIEVE_MEMORY) }
+    });
+  }
+
+  // 2. Fix Step IDs (ensure sequential "1", "2", ...)
+  normalizedSteps.forEach((step, index) => {
+    step.id = (index + 1).toString();
+  });
+
+  // 3. Sync memory requirements
+  const hasMemoryRetrieve = normalizedSteps.some(s => s.type === PlanStepType.RETRIEVE_MEMORY);
+  if (hasMemoryRetrieve) {
+    plan.meta.requires_memory = true;
+    const contextStep = normalizedSteps.find(s => s.type === PlanStepType.BUILD_CONTEXT);
+    if (contextStep) contextStep.args.include_memory = true;
+  }
+
+  // 4. Append REASON if only BUILD_CONTEXT exists for non-trivial intent
+  if (normalizedSteps.length === 1 && plan.meta.intent !== "trivial") {
+    normalizedSteps.push({
+      id: (normalizedSteps.length + 1).toString(),
+      type: PlanStepType.REASON,
+      args: { model: "gemini", temperature: 0.7 }
+    });
+  }
+
+  return { ...plan, steps: normalizedSteps };
+}
+
+/**
+ * Layer 2: Validator
+ * Strictly rejects plans that violate safety or logic rules.
+ */
+export function validatePlan(plan: ExecutionPlan): void {
+  if (!plan.meta || !plan.meta.intent) throw new Error("Plan meta missing or invalid");
+  if (!plan.steps || !Array.isArray(plan.steps) || plan.steps.length === 0) throw new Error("Plan steps missing or empty");
+
+  const stepTypes = Object.values(PlanStepType);
+  
+  plan.steps.forEach(step => {
+    if (!step.id) throw new Error("Step ID missing");
+    if (!step.type || !stepTypes.includes(step.type as PlanStepType)) throw new Error(`Invalid Step Type: ${step.type}`);
+    if (!step.args || typeof step.args !== 'object') throw new Error(`Step ${step.id} missing arguments`);
+  });
+
+  const hasBuildContext = plan.steps.some(s => s.type === PlanStepType.BUILD_CONTEXT);
+  if (!hasBuildContext) throw new Error("MANDATORY step 'BUILD_CONTEXT' missing");
+}
+
+/**
+ * Layer 1: Planner (with Retry Logic)
+ * Interacts with LLM and drives the 3-layer pipeline.
+ */
+export async function generatePlan(intent: string, entities: string[], attempt: number = 1): Promise<ExecutionPlan> {
   try {
     const prompt = `Intent: "${intent}"\nEntities: ${JSON.stringify(entities)}`;
     
@@ -258,47 +192,73 @@ export async function generatePlan(intent: string, entities: string[]): Promise<
       prompt: `${SYSTEM_PROMPT}\n\nUser Input:\n${prompt}\n\nJSON Output:`,
       stream: false,
       format: 'json',
-      options: {
-        temperature: 0
-      }
+      options: { temperature: 0 }
     });
 
     const output = (response.data as any).response;
-    const plan: ExecutionPlan = JSON.parse(output);
-    
-    // Safety check: ensure required structure exists
-    if (!plan.meta || !plan.steps || !Array.isArray(plan.steps)) {
-        throw new Error("Invalid plan structure received from SLM");
-    }
+    let plan: ExecutionPlan = JSON.parse(output);
 
-    // Validation: ensure BUILD_CONTEXT exists
-    const hasBuildContext = plan.steps.some(s => s.type === PlanStepType.BUILD_CONTEXT);
-    if (!hasBuildContext) {
-      // Inject BUILD_CONTEXT if missing
-      plan.steps.splice(0, 0, {
-        id: "context_fix",
-        type: PlanStepType.BUILD_CONTEXT,
-        args: { include_memory: plan.meta.requires_memory }
-      });
-    }
+    // Pipeline: RAW -> NORMALIZE -> VALIDATE
+    plan = normalizePlan(plan);
+    validatePlan(plan);
 
-    console.log("PLAN: ")
-    console.log(plan)
+    console.log(`[ATTEMPT ${attempt}] Valid Plan Generated:`, plan.meta.intent);
     return plan;
+
   } catch (error: any) {
-    console.error('AI Planning error:', error);
-    
-    // Fallback to a basic plan if AI fails
+    console.error(`AI Planning error (Attempt ${attempt}):`, error.message);
+
+    if (attempt < 2) {
+      console.log("Retrying planning...");
+      return generatePlan(intent, entities, attempt + 1);
+    }
+
+    // Layer 5 Fallback: Robust safe plan
+    console.warn("Retries exhausted. Using safe fallback plan.");
     return {
-      meta: {
-        intent,
-        requires_memory: false,
-        requires_reasoning: true
-      },
+      meta: { intent: `FALLBACK: ${intent}`, requires_memory: false, requires_reasoning: true },
       steps: [
         { id: "1", type: PlanStepType.BUILD_CONTEXT, args: { include_memory: false } },
         { id: "2", type: PlanStepType.REASON, args: { model: "gemini", temperature: 0.7 } }
       ]
     };
   }
+}
+
+/**
+ * Layer 6: Execution Mapping
+ * Maps IR steps to actual system behaviors.
+ */
+export async function executeStep(step: Step): Promise<any> {
+    console.log(`Executing Step ${step.id}: ${step.type}`);
+    switch (step.type) {
+        case PlanStepType.RETRIEVE_MEMORY:
+            return `MOCK: memory.retrieve(${JSON.stringify(step.args)})`;
+        case PlanStepType.BUILD_CONTEXT:
+            return `MOCK: contextBuilder(${JSON.stringify(step.args)})`;
+        case PlanStepType.REASON:
+            return `MOCK: llmCall(${JSON.stringify(step.args)})`;
+        case PlanStepType.GENERATE_CODE:
+            return `MOCK: codeGenerator(${JSON.stringify(step.args)})`;
+        case PlanStepType.GENERATE_FILE:
+            return `MOCK: fileGenerator(${JSON.stringify(step.args)})`;
+        case PlanStepType.RUN_COMMAND:
+            return `MOCK: systemExec(${JSON.stringify(step.args)})`;
+        default:
+            throw new Error(`Execution error: Unknown step type ${step.type}`);
+    }
+}
+
+export async function executePlan(plan: ExecutionPlan): Promise<void> {
+    console.log(`STARTING EXECUTION: ${plan.meta.intent}`);
+    for (const step of plan.steps) {
+        try {
+            const result = await executeStep(step);
+            console.log(`Step ${step.id} result:`, result);
+        } catch (error: any) {
+            console.error(`Step ${step.id} failed:`, error.message);
+            break; // Stop execution on failure
+        }
+    }
+    console.log("EXECUTION FINISHED");
 }
