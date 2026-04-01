@@ -85,6 +85,7 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
+          prompt: input,
           intent: data.intents[0], 
           entities: data.entities 
         }),

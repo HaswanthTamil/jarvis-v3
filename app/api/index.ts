@@ -41,15 +41,15 @@ app.post('/api/classify', async (req: Request, res: Response) => {
 });
 
 app.post('/api/plan', async (req: Request, res: Response) => {
-  const { intent, entities } = req.body;
+  const { prompt, intent, entities } = req.body;
 
-  if (!intent) {
-    return res.status(400).json({ error: 'Intent is required' });
+  if (!prompt) {
+    return res.status(400).json({ error: 'Prompt is required' });
   }
 
   try {
-    console.log(`Generating plan for intent: "${intent}"`);
-    const plan = await generatePlan(intent, entities || []);
+    console.log(`Generating plan for\nPrompt: "${prompt}\nIntent: "${intent}\nEntities: "${entities}"`);
+    const plan = await generatePlan(prompt);
     res.json(plan);
   } catch (error: any) {
     console.error('Planning error:', error.message);

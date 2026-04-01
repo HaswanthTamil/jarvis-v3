@@ -3,6 +3,8 @@ import axios from 'axios';
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
 const MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:1.5b';
 
+// --- TYPES ---
+
 export enum PlanStepType {
   RETRIEVE_MEMORY = 'RETRIEVE_MEMORY',
   BUILD_CONTEXT = 'BUILD_CONTEXT',
@@ -12,93 +14,18 @@ export enum PlanStepType {
   RUN_COMMAND = 'RUN_COMMAND'
 }
 
-const SYSTEM_PROMPT_FOR_LARGE_MODEL = `
-You are a planning agent for Jarvis, an AI system. 
-Analyze the User Intent and Entities provided and generate a structured execution plan using ONLY the provided PlanStepType enum.
+export type Task =
+  | { type: "RUN_SCRIPT"; script: string; description: string }
+  | { type: "CALL_API"; url: string; method: "POST"; description: string; bodyFrom?: number }
+  | { type: "DISPLAY_OUTPUT"; description: string; sourceStep?: number }
+  | { type: "GENERATE_CODE"; description: string }
+  | { type: "GENERATE_FILE"; fileType: "pdf" | "txt" | "md"; description: string };
 
-PlanStepType Enum:
-1. RETRIEVE_MEMORY:
-   - Used when user asks about stored data, past projects, or known info.
-   - args: { "scope": "projects|knowledge|personal", "query": "string", "limit": number }
-2. BUILD_CONTEXT:
-   - MUST always be present before execution steps.
-   - args: { "include_memory": boolean }
-3. REASON:
-   - General reasoning / answering / chatbot behavior.
-   - args: { "model": "gemini|local", "temperature": number }
-4. GENERATE_CODE:
-   - Used when user wants code or files with code content.
-   - args: { "language": "string", "description": "string" }
-5. GENERATE_FILE:
-   - Used when user wants files like pdf, txt, md.
-   - args: { "type": "pdf|txt|md", "content": "string" }
-6. RUN_COMMAND:
-   - Used for terminal/system execution.
-   - args: { "command": "string" }
-
-PLANNING RULES:
-- You MUST ONLY use the provided PlanStepType enum.
-- You MUST NOT invent new step types.
-- First step: RETRIEVE_MEMORY (if needed).
-- Second step: BUILD_CONTEXT (always required).
-- Final step: one of REASON / GENERATE_CODE / GENERATE_FILE / RUN_COMMAND.
-- If RETRIEVE_MEMORY is used → BUILD_CONTEXT.include_memory = true.
-- ids must be sequential strings ("1", "2", ...).
-- Output MUST be valid JSON (no markdown, no comments).
-
-Output Format:
-{
-  "meta": {
-    "intent": "string",
-    "requires_memory": boolean,
-    "requires_reasoning": boolean
-  },
-  "steps": [
-    {
-      "id": "1",
-      "type": "BUILD_CONTEXT",
-      "args": { "include_memory": false }
-    }
-  ]
-}
-`;
-
-const SYSTEM_PROMPT_FOR_SMALL_MODEL = `
-You are a planning agent for Jarvis.
-
-Your job is to convert a user request into a STRICT execution plan using a fixed enum system (Intermediate Representation).
-
----
-AVAILABLE STEP TYPES (ENUM)
-- RETRIEVE_MEMORY: { "scope": "projects|knowledge|personal", "query": "string", "limit": number }
-- BUILD_CONTEXT: { "include_memory": boolean }
-- REASON: { "model": "gemini|local", "temperature": number }
-- GENERATE_CODE: { "language": "string", "description": "string" }
-- GENERATE_FILE: { "type": "pdf|txt|md", "content": "string" }
-- RUN_COMMAND: { "command": "string" }
-
----
-PLANNING RULES
-1. MANDATORY: Every plan MUST start with a BUILD_CONTEXT step.
-2. If memory is needed, use RETRIEVE_MEMORY first, then BUILD_CONTEXT with include_memory: true.
-3. Multiple steps are encouraged for complex tasks (e.g., BUILD -> RUN_COMMAND -> REASON).
-4. OUTPUT ONLY JSON. No explanations.
-
----
-FEW-SHOT EXAMPLE
-User Input: "run script.sh and explain output"
-Output:
-{
-  "meta": { "intent": "script_execution", "requires_memory": false, "requires_reasoning": true },
-  "steps": [
-    { "id": "1", "type": "BUILD_CONTEXT", "args": { "include_memory": false } },
-    { "id": "2", "type": "RUN_COMMAND", "args": { "command": "bash script.sh" } },
-    { "id": "3", "type": "REASON", "args": { "model": "local", "temperature": 0 } }
-  ]
-}
-`;
-
-const SYSTEM_PROMPT = process.env.LOCAL_SLM_SIZE === 'small' ? SYSTEM_PROMPT_FOR_SMALL_MODEL : SYSTEM_PROMPT_FOR_LARGE_MODEL;
+export type ScoredTask = {
+  task: Task | null;
+  confidence: number; // 0 to 1
+  source: "deterministic" | "fuzzy" | "llm";
+};
 
 export interface Step {
   id: string;
@@ -117,118 +44,363 @@ export interface ExecutionPlan {
   steps: Step[];
 }
 
-/**
- * Layer 3: Normalizer
- * Auto-corrects common LLM mistakes to make plans executable.
- */
-export function normalizePlan(plan: ExecutionPlan): ExecutionPlan {
-  const normalizedSteps: Step[] = [...plan.steps];
-
-  // 1. Ensure BUILD_CONTEXT exists at the start
-  const firstStep = normalizedSteps[0];
-  if (!firstStep || firstStep.type !== PlanStepType.BUILD_CONTEXT) {
-    normalizedSteps.unshift({
-      id: "placeholder",
-      type: PlanStepType.BUILD_CONTEXT,
-      args: { include_memory: plan.meta.requires_memory || normalizedSteps.some(s => s.type === PlanStepType.RETRIEVE_MEMORY) }
-    });
-  }
-
-  // 2. Fix Step IDs (ensure sequential "1", "2", ...)
-  normalizedSteps.forEach((step, index) => {
-    step.id = (index + 1).toString();
-  });
-
-  // 3. Sync memory requirements
-  const hasMemoryRetrieve = normalizedSteps.some(s => s.type === PlanStepType.RETRIEVE_MEMORY);
-  if (hasMemoryRetrieve) {
-    plan.meta.requires_memory = true;
-    const contextStep = normalizedSteps.find(s => s.type === PlanStepType.BUILD_CONTEXT);
-    if (contextStep) contextStep.args.include_memory = true;
-  }
-
-  // 4. Append REASON if only BUILD_CONTEXT exists for non-trivial intent
-  if (normalizedSteps.length === 1 && plan.meta.intent !== "trivial") {
-    normalizedSteps.push({
-      id: (normalizedSteps.length + 1).toString(),
-      type: PlanStepType.REASON,
-      args: { model: "gemini", temperature: 0.7 }
-    });
-  }
-
-  return { ...plan, steps: normalizedSteps };
-}
+// --- MODULE 1: SENTENCE DECOMPOSER ---
 
 /**
- * Layer 2: Validator
- * Strictly rejects plans that violate safety or logic rules.
+ * Splits raw user input into atomic imperative instructions.
  */
-export function validatePlan(plan: ExecutionPlan): void {
-  if (!plan.meta || !plan.meta.intent) throw new Error("Plan meta missing or invalid");
-  if (!plan.steps || !Array.isArray(plan.steps) || plan.steps.length === 0) throw new Error("Plan steps missing or empty");
+export async function decomposeRequest(input: string): Promise<string[]> {
+  console.log("[PLANNER] Decomposing request:", input);
 
-  const stepTypes = Object.values(PlanStepType);
   
-  plan.steps.forEach(step => {
-    if (!step.id) throw new Error("Step ID missing");
-    if (!step.type || !stepTypes.includes(step.type as PlanStepType)) throw new Error(`Invalid Step Type: ${step.type}`);
-    if (!step.args || typeof step.args !== 'object') throw new Error(`Step ${step.id} missing arguments`);
-  });
+  const prompt = `Decompose the following user request into a JSON array of atomic, imperative instructions. 
+Rules:
+- Each sentence must represent EXACTLY ONE action.
+- Preserve order.
+- Do NOT infer or add steps.
+- Output MUST be a valid JSON array of strings.
+- Each sentence should contain the necessary information to perform the action. Do NOT add any extra information.
 
-  const hasBuildContext = plan.steps.some(s => s.type === PlanStepType.BUILD_CONTEXT);
-  if (!hasBuildContext) throw new Error("MANDATORY step 'BUILD_CONTEXT' missing");
-}
+Input: "${input}"
+Output:`;
 
-/**
- * Layer 1: Planner (with Retry Logic)
- * Interacts with LLM and drives the 3-layer pipeline.
- */
-export async function generatePlan(intent: string, entities: string[], attempt: number = 1): Promise<ExecutionPlan> {
   try {
-    const prompt = `Intent: "${intent}"\nEntities: ${JSON.stringify(entities)}`;
-    
     const response = await axios.post(OLLAMA_URL, {
       model: MODEL,
-      prompt: `${SYSTEM_PROMPT}\n\nUser Input:\n${prompt}\n\nJSON Output:`,
+      prompt,
+      stream: false,
+      format: 'json',
+      options: { temperature: 0 }
+    });
+    const output = (response.data as any).response;
+    let sentences = JSON.parse(output);
+
+    if (!Array.isArray(sentences)) {
+      console.log("[PLANNER] LLM output is not an array, attempting object → array conversion:");
+      console.log(sentences);
+
+      if (typeof sentences === "object" && sentences !== null) {
+        sentences = Object.values(sentences);
+      } else {
+        throw new Error("Parsed output is neither array nor object");
+      }
+    }
+
+    const cleaned = sentences.map((s: string) => s.trim()).filter((s: string) => s.length > 0);
+    if (cleaned.length === 0) throw new Error("No instructions found");
+
+    console.log("[PLANNER] Decomposed into:", cleaned);
+    return cleaned;
+  } catch (error: any) {
+    console.error("[PLANNER] Decomposition failed:", error.message);
+    // Fallback: return as single instruction if LLM fails
+    return [input];
+  }
+}
+
+// --- MODULE 2: TASK EXTRACTION ---
+
+const TASK_REGEX = {
+  RUN_SCRIPT: /(?:run|execute)\s+(?:the\s+script\s+)?(\S+\.(?:sh|py|js|ts|rb|pl))/i,
+  CALL_API: /(?:send|post|call|request)\s+(?:the\s+)?(?:output\s+)?(?:to\s+|api\s+)?(https?:\/\/\S+)/i,
+  DISPLAY_OUTPUT: /(?:print|show|display|echo|output)\s+(?:the\s+)?(?:response|output|result)/i,
+  GENERATE_CODE: /(?:generate|write|create)\s+(?:code|snippet)\s+(?:for\s+)?(.+)/i,
+  GENERATE_FILE: /(?:generate|create|make)\s+(?:a\s+)?(\S+)\s+(?:file|document|report)/i
+};
+
+const FUZZY_KEYWORDS = {
+  RUN_SCRIPT: ['run', 'script', 'bash', 'sh', 'python', 'execute'],
+  CALL_API: ['http', 'https', 'api', 'endpoint', 'url', 'post', 'send'],
+  DISPLAY_OUTPUT: ['print', 'show', 'display', 'output', 'response'],
+  GENERATE_CODE: ['code', 'function', 'class', 'script', 'generate'],
+  GENERATE_FILE: ['file', 'pdf', 'txt', 'md', 'document', 'report']
+};
+
+/**
+ * Deterministic pattern matching for high-confidence extraction.
+ */
+function extractDeterministic(sentence: string): ScoredTask {
+  if (TASK_REGEX.RUN_SCRIPT.test(sentence)) {
+    const match = sentence.match(TASK_REGEX.RUN_SCRIPT);
+    return { task: { type: "RUN_SCRIPT", script: match![1], description: sentence }, confidence: 1.0, source: "deterministic" };
+  }
+  if (TASK_REGEX.CALL_API.test(sentence)) {
+    const match = sentence.match(TASK_REGEX.CALL_API);
+    return { task: { type: "CALL_API", url: match![1], method: "POST", description: sentence }, confidence: 1.0, source: "deterministic" };
+  }
+  if (TASK_REGEX.DISPLAY_OUTPUT.test(sentence)) {
+    return { task: { type: "DISPLAY_OUTPUT", description: sentence }, confidence: 1.0, source: "deterministic" };
+  }
+  if (TASK_REGEX.GENERATE_CODE.test(sentence)) {
+    const match = sentence.match(TASK_REGEX.GENERATE_CODE);
+    return { task: { type: "GENERATE_CODE", description: sentence }, confidence: 1.0, source: "deterministic" };
+  }
+  if (TASK_REGEX.GENERATE_FILE.test(sentence)) {
+    const match = sentence.match(TASK_REGEX.GENERATE_FILE);
+    const ext = match![1].split('.').pop();
+    const type = (ext === 'pdf' || ext === 'md') ? ext : 'txt';
+    return { task: { type: "GENERATE_FILE", fileType: type as any, description: sentence }, confidence: 1.0, source: "deterministic" };
+  }
+  return { task: null, confidence: 0, source: "deterministic" };
+}
+
+/**
+ * Fuzzy matching based on keyword overlap.
+ */
+function extractFuzzy(sentence: string): ScoredTask {
+  const words = sentence.toLowerCase().split(/\W+/);
+  let bestType: any = null;
+  let maxScore = 0;
+
+  for (const [type, keywords] of Object.entries(FUZZY_KEYWORDS)) {
+    const matches = keywords.filter(k => words.includes(k));
+    const score = matches.length / keywords.length;
+    if (score > maxScore) {
+      maxScore = score;
+      bestType = type;
+    }
+  }
+
+  if (maxScore > 0.3) {
+    // Map fuzzy result to partially populated task
+    let task: Task | null = null;
+    switch (bestType) {
+      case "RUN_SCRIPT": task = { type: "RUN_SCRIPT", script: "unknown", description: sentence }; break;
+      case "CALL_API": task = { type: "CALL_API", url: "unknown", method: "POST", description: sentence }; break;
+      case "DISPLAY_OUTPUT": task = { type: "DISPLAY_OUTPUT", description: sentence }; break;
+      case "GENERATE_CODE": task = { type: "GENERATE_CODE", description: sentence }; break;
+      case "GENERATE_FILE": task = { type: "GENERATE_FILE", fileType: "txt", description: sentence }; break;
+    }
+    return { task, confidence: Math.min(maxScore, 0.8), source: "fuzzy" };
+  }
+
+  return { task: null, confidence: 0, source: "fuzzy" };
+}
+
+/**
+ * LLM-based classification fallback.
+ */
+async function extractLLM(sentence: string): Promise<ScoredTask> {
+  const prompt = `Classify the following atomic instruction into one of these task types:
+- RUN_SCRIPT (args: { parameters: list, description: string })
+- CALL_API (args: { url: string, method: "POST", description: string })
+- DISPLAY_OUTPUT (args: { description: string })
+- GENERATE_CODE (args: { description: string })
+- GENERATE_FILE (args: { fileType: "pdf" | "txt" | "md", description: string })
+
+Rules:
+- Output ONLY valid JSON.
+- Do NOT generate plans or raw commands. args should only contain required parameters and description for the task.
+- If type is unknown, set type to null.
+- Task type naming convention should be as exact as mentioned above.
+
+Instruction: "${sentence}"
+Result:`;
+
+  try {
+    const response = await axios.post(OLLAMA_URL, {
+      model: MODEL,
+      prompt,
       stream: false,
       format: 'json',
       options: { temperature: 0 }
     });
 
-    const output = (response.data as any).response;
-    let plan: ExecutionPlan = JSON.parse(output);
+    const result = JSON.parse((response.data as any).response);
+    if (!result.type) return { task: null, confidence: 0, source: "llm" };
 
-    // Pipeline: RAW -> NORMALIZE -> VALIDATE
-    plan = normalizePlan(plan);
-    validatePlan(plan);
-
-    console.log(`[ATTEMPT ${attempt}] Valid Plan Generated:`, plan.meta.intent);
-    return plan;
-
+    return { task: { ...result.args, type: result.type }, confidence: 0.9, source: "llm" };
   } catch (error: any) {
-    console.error(`AI Planning error (Attempt ${attempt}):`, error.message);
-
-    if (attempt < 2) {
-      console.log("Retrying planning...");
-      return generatePlan(intent, entities, attempt + 1);
-    }
-
-    // Layer 5 Fallback: Robust safe plan
-    console.warn("Retries exhausted. Using safe fallback plan.");
-    return {
-      meta: { intent: `FALLBACK: ${intent}`, requires_memory: false, requires_reasoning: true },
-      steps: [
-        { id: "1", type: PlanStepType.BUILD_CONTEXT, args: { include_memory: false } },
-        { id: "2", type: PlanStepType.REASON, args: { model: "gemini", temperature: 0.7 } }
-      ]
-    };
+    return { task: null, confidence: 0, source: "llm" };
   }
 }
 
 /**
- * Layer 6: Execution Mapping
- * Maps IR steps to actual system behaviors.
+ * Extracts a task from a single sentence using hybrid strategy.
  */
+export async function extractTask(sentence: string): Promise<ScoredTask> {
+  console.log(`[PLANNER] Extracting task from: "${sentence}"`);
+
+  // 1. Deterministic
+  const detResult = extractDeterministic(sentence);
+  if (detResult.confidence === 1.0) return detResult;
+
+  // 2. Fuzzy
+  const fuzzyResult = extractFuzzy(sentence);
+  if (fuzzyResult.confidence > 0.6) return fuzzyResult;
+
+  // 3. LLM Fallback
+  const llmResult = await extractLLM(sentence);
+  if (llmResult.confidence > 0.5) return llmResult;
+
+  return detResult; // Return lowest confidence deterministic if all fail
+}
+
+
+// --- MODULE 3: DEPENDENCY LINKING ---
+
+/**
+ * Connects tasks in sequence and infers dependencies.
+ */
+export function linkDependencies(scoredTasks: ScoredTask[]): Task[] {
+  console.log("[PLANNER] Linking dependencies");
+  const tasks: Task[] = [];
+  
+  for (let i = 0; i < scoredTasks.length; i++) {
+    const scored = scoredTasks[i];
+    if (!scored.task) continue;
+    
+    const task = { ...scored.task };
+    
+    // Simple sequential dependency: if I'm not the first task, 
+    // I might depend on the output of the previous task.
+    if (i > 0) {
+      if (task.type === "CALL_API") {
+        task.bodyFrom = i + 1; // Step ID of the previous task (BUILD_CONTEXT is 1, Tasks start at 2)
+      } else if (task.type === "DISPLAY_OUTPUT") {
+        task.sourceStep = i + 1;
+      }
+    }
+    
+    tasks.push(task);
+  }
+  
+  return tasks;
+}
+
+// --- MODULE 5: TASK -> PLANSTEP MAPPING ---
+
+/**
+ * Converts a high-level Task into a low-level PlanStep with declarative args.
+ */
+export function mapTaskToStep(task: Task, id: string): Step {
+  switch (task.type) {
+    case "RUN_SCRIPT":
+      return { 
+        id, 
+        type: PlanStepType.RUN_COMMAND, 
+        args: { script: task.script, description: task.description } 
+      };
+    case "CALL_API":
+      const bodyRef = task.bodyFrom ? `<output_of_step_${task.bodyFrom}>` : "";
+      return { 
+        id, 
+        type: PlanStepType.RUN_COMMAND, 
+        args: { 
+          url: task.url, 
+          method: task.method, 
+          bodyRef, 
+          description: task.description 
+        } 
+      };
+    case "DISPLAY_OUTPUT":
+      const sourceRef = task.sourceStep ? `<output_of_step_${task.sourceStep}>` : "";
+      return { 
+        id, 
+        type: PlanStepType.REASON, 
+        args: { 
+          sourceRef, 
+          description: task.description 
+        } 
+      };
+    case "GENERATE_CODE":
+      return { 
+        id, 
+        type: PlanStepType.GENERATE_CODE, 
+        args: { description: task.description } 
+      };
+    case "GENERATE_FILE":
+      return { 
+        id, 
+        type: PlanStepType.GENERATE_FILE, 
+        args: { type: task.fileType, description: task.description } 
+      };
+  }
+}
+
+
+// --- CORE PIPELINE ---
+
+export async function generatePlan(input: string): Promise<ExecutionPlan> {
+  // 1. Decompose
+  const sentences = await decomposeRequest(input);
+  
+  // 2. Extract Tasks
+  const scoredTasks: ScoredTask[] = [];
+  for (const sentence of sentences) {
+    scoredTasks.push(await extractTask(sentence));
+  }
+
+  // 3. Link Dependencies
+  const tasks = linkDependencies(scoredTasks);
+
+  // 4. Map to Steps
+  const steps: Step[] = [];
+  
+  // ALWAYS start with BUILD_CONTEXT (Module 5 Rule)
+  steps.push({
+    id: "1",
+    type: PlanStepType.BUILD_CONTEXT,
+    args: { include_memory: false }
+  });
+
+  // Map each task to a step starting from ID 2
+  tasks.forEach((task, index) => {
+    steps.push(mapTaskToStep(task, (index + 2).toString()));
+  });
+
+  // 5. Build Final Plan (Module 6)
+  const plan: ExecutionPlan = {
+    meta: {
+      intent: input,
+      requires_memory: false,
+      requires_reasoning: steps.length > 2
+    },
+    steps
+  };
+
+  // 6. Validate & Normalize (Module 7 & 8)
+  const finalPlan = normalizePlan(validatePlan(plan));
+  console.log("FINAL PLAN:");
+  console.log(JSON.stringify(finalPlan, null, 2));
+  return finalPlan;
+}
+
+// --- MODULE 7 & 8: VALIDATION & NORMALIZATION ---
+
+export function validatePlan(plan: ExecutionPlan): ExecutionPlan {
+  if (plan.steps.length === 0) throw new Error("Plan steps cannot be empty");
+  if (plan.steps[0].type !== PlanStepType.BUILD_CONTEXT) throw new Error("First step must be BUILD_CONTEXT");
+  
+  plan.steps.forEach((step, index) => {
+    if (step.id !== (index + 1).toString()) throw new Error(`Invalid step ID: ${step.id} at index ${index}`);
+  });
+  
+  return plan;
+}
+
+export function normalizePlan(plan: ExecutionPlan): ExecutionPlan {
+  // Ensure sequential IDs (already mostly handled but for safety)
+  plan.steps.forEach((step, index) => {
+    step.id = (index + 1).toString();
+  });
+  
+  // If only BUILD_CONTEXT exists, append a REASON step
+  if (plan.steps.length === 1) {
+    plan.steps.push({
+      id: "2",
+      type: PlanStepType.REASON,
+      args: { model: "local", prompt: "How can I help you further?" }
+    });
+    plan.meta.requires_reasoning = true;
+  }
+  
+  return plan;
+}
+
+
+// --- EXISTING EXECUTION LOGIC (MOCKS) ---
+
 export async function executeStep(step: Step): Promise<any> {
     console.log(`Executing Step ${step.id}: ${step.type}`);
     switch (step.type) {
@@ -257,8 +429,9 @@ export async function executePlan(plan: ExecutionPlan): Promise<void> {
             console.log(`Step ${step.id} result:`, result);
         } catch (error: any) {
             console.error(`Step ${step.id} failed:`, error.message);
-            break; // Stop execution on failure
+            break;
         }
     }
     console.log("EXECUTION FINISHED");
 }
+
