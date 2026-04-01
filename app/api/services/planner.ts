@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { TASK_CONFIG, TaskDefinition } from './tasks.config';
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
 const MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:1.5b';
@@ -15,7 +16,7 @@ export enum PlanStepType {
 }
 
 export type Task =
-  | { type: "RUN_SCRIPT"; script: string; description: string }
+  | { type: "RUN_SCRIPT"; parameters: string; description: string }
   | { type: "CALL_API"; url: string; method: "POST"; description: string; bodyFrom?: number }
   | { type: "DISPLAY_OUTPUT"; description: string; sourceStep?: number }
   | { type: "GENERATE_CODE"; description: string }
@@ -100,46 +101,29 @@ Output:`;
 
 // --- MODULE 2: TASK EXTRACTION ---
 
-const TASK_REGEX = {
-  RUN_SCRIPT: /(?:run|execute)\s+(?:the\s+script\s+)?(\S+\.(?:sh|py|js|ts|rb|pl))/i,
-  CALL_API: /(?:send|post|call|request)\s+(?:the\s+)?(?:output\s+)?(?:to\s+|api\s+)?(https?:\/\/\S+)/i,
-  DISPLAY_OUTPUT: /(?:print|show|display|echo|output)\s+(?:the\s+)?(?:response|output|result)/i,
-  GENERATE_CODE: /(?:generate|write|create)\s+(?:code|snippet)\s+(?:for\s+)?(.+)/i,
-  GENERATE_FILE: /(?:generate|create|make)\s+(?:a\s+)?(\S+)\s+(?:file|document|report)/i
-};
-
-const FUZZY_KEYWORDS = {
-  RUN_SCRIPT: ['run', 'script', 'bash', 'sh', 'python', 'execute'],
-  CALL_API: ['http', 'https', 'api', 'endpoint', 'url', 'post', 'send'],
-  DISPLAY_OUTPUT: ['print', 'show', 'display', 'output', 'response'],
-  GENERATE_CODE: ['code', 'function', 'class', 'script', 'generate'],
-  GENERATE_FILE: ['file', 'pdf', 'txt', 'md', 'document', 'report']
-};
-
 /**
  * Deterministic pattern matching for high-confidence extraction.
  */
 function extractDeterministic(sentence: string): ScoredTask {
-  if (TASK_REGEX.RUN_SCRIPT.test(sentence)) {
-    const match = sentence.match(TASK_REGEX.RUN_SCRIPT);
-    return { task: { type: "RUN_SCRIPT", script: match![1], description: sentence }, confidence: 1.0, source: "deterministic" };
-  }
-  if (TASK_REGEX.CALL_API.test(sentence)) {
-    const match = sentence.match(TASK_REGEX.CALL_API);
-    return { task: { type: "CALL_API", url: match![1], method: "POST", description: sentence }, confidence: 1.0, source: "deterministic" };
-  }
-  if (TASK_REGEX.DISPLAY_OUTPUT.test(sentence)) {
-    return { task: { type: "DISPLAY_OUTPUT", description: sentence }, confidence: 1.0, source: "deterministic" };
-  }
-  if (TASK_REGEX.GENERATE_CODE.test(sentence)) {
-    const match = sentence.match(TASK_REGEX.GENERATE_CODE);
-    return { task: { type: "GENERATE_CODE", description: sentence }, confidence: 1.0, source: "deterministic" };
-  }
-  if (TASK_REGEX.GENERATE_FILE.test(sentence)) {
-    const match = sentence.match(TASK_REGEX.GENERATE_FILE);
-    const ext = match![1].split('.').pop();
-    const type = (ext === 'pdf' || ext === 'md') ? ext : 'txt';
-    return { task: { type: "GENERATE_FILE", fileType: type as any, description: sentence }, confidence: 1.0, source: "deterministic" };
+  for (const config of TASK_CONFIG) {
+    if (config.regex.test(sentence)) {
+      const match = sentence.match(config.regex);
+      const task: any = { type: config.type, description: sentence };
+      
+      if (config.extractionMap) {
+        Object.entries(config.extractionMap).forEach(([groupIndex, key]) => {
+          task[key] = match![parseInt(groupIndex)];
+        });
+      }
+      
+      // Special override for file type extraction
+      if (config.type === "GENERATE_FILE" && task.fileType) {
+        const ext = task.fileType.split('.').pop();
+        task.fileType = (ext === 'pdf' || ext === 'md') ? ext : 'txt';
+      }
+
+      return { task, confidence: 1.0, source: "deterministic" };
+    }
   }
   return { task: null, confidence: 0, source: "deterministic" };
 }
@@ -149,28 +133,25 @@ function extractDeterministic(sentence: string): ScoredTask {
  */
 function extractFuzzy(sentence: string): ScoredTask {
   const words = sentence.toLowerCase().split(/\W+/);
-  let bestType: any = null;
+  let bestConfig: TaskDefinition | null = null;
   let maxScore = 0;
 
-  for (const [type, keywords] of Object.entries(FUZZY_KEYWORDS)) {
-    const matches = keywords.filter(k => words.includes(k));
-    const score = matches.length / keywords.length;
+  for (const config of TASK_CONFIG) {
+    const matches = config.fuzzyKeywords.filter(k => words.includes(k));
+    const score = matches.length / config.fuzzyKeywords.length;
     if (score > maxScore) {
       maxScore = score;
-      bestType = type;
+      bestConfig = config;
     }
   }
 
-  if (maxScore > 0.3) {
-    // Map fuzzy result to partially populated task
-    let task: Task | null = null;
-    switch (bestType) {
-      case "RUN_SCRIPT": task = { type: "RUN_SCRIPT", script: "unknown", description: sentence }; break;
-      case "CALL_API": task = { type: "CALL_API", url: "unknown", method: "POST", description: sentence }; break;
-      case "DISPLAY_OUTPUT": task = { type: "DISPLAY_OUTPUT", description: sentence }; break;
-      case "GENERATE_CODE": task = { type: "GENERATE_CODE", description: sentence }; break;
-      case "GENERATE_FILE": task = { type: "GENERATE_FILE", fileType: "txt", description: sentence }; break;
-    }
+  if (maxScore > 0.3 && bestConfig) {
+    const task: any = { type: bestConfig.type, description: sentence };
+    // Provide safe defaults for fuzzy matched tasks
+    if (bestConfig.type === "RUN_SCRIPT") task.parameters = "unknown";
+    if (bestConfig.type === "CALL_API") { task.url = "unknown"; task.method = "POST"; }
+    if (bestConfig.type === "GENERATE_FILE") task.fileType = "txt";
+
     return { task, confidence: Math.min(maxScore, 0.8), source: "fuzzy" };
   }
 
@@ -181,12 +162,10 @@ function extractFuzzy(sentence: string): ScoredTask {
  * LLM-based classification fallback.
  */
 async function extractLLM(sentence: string): Promise<ScoredTask> {
+  const taskOptions = TASK_CONFIG.map(t => `- ${t.type} (args: ${t.argsTemplate})`).join('\n');
+
   const prompt = `Classify the following atomic instruction into one of these task types:
-- RUN_SCRIPT (args: { parameters: list, description: string })
-- CALL_API (args: { url: string, method: "POST", description: string })
-- DISPLAY_OUTPUT (args: { description: string })
-- GENERATE_CODE (args: { description: string })
-- GENERATE_FILE (args: { fileType: "pdf" | "txt" | "md", description: string })
+${taskOptions}
 
 Rules:
 - Output ONLY valid JSON.
@@ -279,7 +258,7 @@ export function mapTaskToStep(task: Task, id: string): Step {
       return { 
         id, 
         type: PlanStepType.RUN_COMMAND, 
-        args: { script: task.script, description: task.description } 
+        args: { parameters: task.parameters, description: task.description } 
       };
     case "CALL_API":
       const bodyRef = task.bodyFrom ? `<output_of_step_${task.bodyFrom}>` : "";
