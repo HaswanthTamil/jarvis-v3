@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { TASK_CONFIG, TaskDefinition } from './tasks.config';
+import { TASK_CONFIG, TaskDefinition, TASKS } from './tasks.config';
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
 const MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:1.5b';
@@ -16,11 +16,11 @@ export enum PlanStepType {
 }
 
 export type Task =
-  | { type: "RUN_SCRIPT"; parameters: string; description: string }
-  | { type: "CALL_API"; url: string; method: "POST"; description: string; bodyFrom?: number }
-  | { type: "DISPLAY_OUTPUT"; description: string; sourceStep?: number }
-  | { type: "GENERATE_CODE"; description: string }
-  | { type: "GENERATE_FILE"; fileType: "pdf" | "txt" | "md"; description: string };
+  | { type: typeof TASKS.RUN_COMMAND; command: string; description: string }
+  | { type: typeof TASKS.DISPLAY_OUTPUT; description: string; sourceStep?: number }
+  | { type: typeof TASKS.GENERATE_CODE; description: string }
+  | { type: typeof TASKS.GENERATE_FILE; fileType: "pdf" | "txt" | "md"; description: string }
+  // | { type: typeof TASKS.LLM_REASON; prompt: string; description: string };
 
 export type ScoredTask = {
   task: Task | null;
@@ -148,9 +148,9 @@ function extractFuzzy(sentence: string): ScoredTask {
   if (maxScore > 0.3 && bestConfig) {
     const task: any = { type: bestConfig.type, description: sentence };
     // Provide safe defaults for fuzzy matched tasks
-    if (bestConfig.type === "RUN_SCRIPT") task.parameters = "unknown";
-    if (bestConfig.type === "CALL_API") { task.url = "unknown"; task.method = "POST"; }
-    if (bestConfig.type === "GENERATE_FILE") task.fileType = "txt";
+    if (bestConfig.type === TASKS.RUN_COMMAND) task.command = "unknown";
+    if (bestConfig.type === TASKS.GENERATE_FILE) task.fileType = "txt";
+    // if (bestConfig.type === TASKS.LLM_REASON) task.prompt = sentence;
 
     return { task, confidence: Math.min(maxScore, 0.8), source: "fuzzy" };
   }
@@ -234,10 +234,8 @@ export function linkDependencies(scoredTasks: ScoredTask[]): Task[] {
     // Simple sequential dependency: if I'm not the first task, 
     // I might depend on the output of the previous task.
     if (i > 0) {
-      if (task.type === "CALL_API") {
-        task.bodyFrom = i + 1; // Step ID of the previous task (BUILD_CONTEXT is 1, Tasks start at 2)
-      } else if (task.type === "DISPLAY_OUTPUT") {
-        task.sourceStep = i + 1;
+      if (task.type === TASKS.DISPLAY_OUTPUT) {
+        (task as any).sourceStep = i + 1;
       }
     }
     
@@ -254,26 +252,14 @@ export function linkDependencies(scoredTasks: ScoredTask[]): Task[] {
  */
 export function mapTaskToStep(task: Task, id: string): Step {
   switch (task.type) {
-    case "RUN_SCRIPT":
+    case TASKS.RUN_COMMAND:
       return { 
         id, 
         type: PlanStepType.RUN_COMMAND, 
-        args: { parameters: task.parameters, description: task.description } 
+        args: { command: task.command, description: task.description } 
       };
-    case "CALL_API":
-      const bodyRef = task.bodyFrom ? `<output_of_step_${task.bodyFrom}>` : "";
-      return { 
-        id, 
-        type: PlanStepType.RUN_COMMAND, 
-        args: { 
-          url: task.url, 
-          method: task.method, 
-          bodyRef, 
-          description: task.description 
-        } 
-      };
-    case "DISPLAY_OUTPUT":
-      const sourceRef = task.sourceStep ? `<output_of_step_${task.sourceStep}>` : "";
+    case TASKS.DISPLAY_OUTPUT:
+      const sourceRef = task.type === TASKS.DISPLAY_OUTPUT && task.sourceStep ? `<output_of_step_${task.sourceStep}>` : "";
       return { 
         id, 
         type: PlanStepType.REASON, 
@@ -282,18 +268,26 @@ export function mapTaskToStep(task: Task, id: string): Step {
           description: task.description 
         } 
       };
-    case "GENERATE_CODE":
+    case TASKS.GENERATE_CODE:
       return { 
         id, 
         type: PlanStepType.GENERATE_CODE, 
         args: { description: task.description } 
       };
-    case "GENERATE_FILE":
+    case TASKS.GENERATE_FILE:
       return { 
         id, 
         type: PlanStepType.GENERATE_FILE, 
-        args: { type: task.fileType, description: task.description } 
+        args: { type: task.type === TASKS.GENERATE_FILE ? task.fileType : 'txt', description: task.description } 
       };
+    // case TASKS.LLM_REASON:
+    //   return {
+    //     id,
+    //     type: PlanStepType.REASON,
+    //     args: { prompt: task.prompt, description: task.description }
+    //   };
+    default:
+      throw new Error(`Unsupported task type: ${(task as any).type}`);
   }
 }
 
